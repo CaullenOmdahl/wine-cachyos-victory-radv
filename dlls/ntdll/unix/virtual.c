@@ -2121,6 +2121,24 @@ static void dump_memory_statistics(void)
  *	View: Success
  *	NULL: Failure
  */
+static inline void vm_mru_insert( struct ntdll_thread_data *td, UINT32 seq, struct file_view *view )
+{
+    unsigned int slot;
+
+    if (seq & 1) return;
+    if (td->vm_mru_seq != seq)
+    {
+        memset( td->vm_mru, 0, sizeof(td->vm_mru) );
+        td->vm_mru_seq = seq;
+        td->vm_mru_next = 0;
+    }
+    slot = td->vm_mru_next++ & 3;
+    td->vm_mru[slot].base = view->base;
+    td->vm_mru[slot].end = (const char *)view->base + view->size;
+    td->vm_mru[slot].view = view;
+    td->vm_mru[slot].protect = view->protect;
+}
+
 static struct file_view *find_view( const void *addr, size_t size )
 {
     struct wine_rb_entry *ptr = views_tree.root;
@@ -2149,22 +2167,7 @@ static struct file_view *find_view( const void *addr, size_t size )
         else if ((const char *)view->base + view->size < (const char *)addr + size) break;  /* size too large */
         else
         {
-            if (!(cur_seq & 1))
-            {
-                unsigned int slot;
-
-                if (td->vm_mru_seq != cur_seq)
-                {
-                    memset( td->vm_mru, 0, sizeof(td->vm_mru) );
-                    td->vm_mru_seq = cur_seq;
-                    td->vm_mru_next = 0;
-                }
-                slot = td->vm_mru_next++ & 3;
-                td->vm_mru[slot].base = view->base;
-                td->vm_mru[slot].end = (const char *)view->base + view->size;
-                td->vm_mru[slot].view = view;
-                td->vm_mru[slot].protect = view->protect;
-            }
+            vm_mru_insert( td, cur_seq, view );
             return view;
         }
     }
@@ -6641,17 +6644,59 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
     ULONGLONG t0 = 0, ts0 = 0;
     int stats = victory_vm_stats_enabled();
     int acquired;
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
+    UINT32 seq1;
 
     base = ROUND_ADDR( addr, page_mask );
 
     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
 
-    /* Find the view containing the address */
-
     if (stats)
     {
         t0 = victory_vm_now_ns();
         VVM_INC( qv_mbi_calls );
+    }
+
+    seq1 = __atomic_load_n( &vm_tree_seq, __ATOMIC_ACQUIRE );
+    if (!(seq1 & 1) && td->vm_mru_seq == seq1)
+    {
+        unsigned int k;
+        for (k = 0; k < 4; k++)
+        {
+            if (td->vm_mru[k].view && base >= (const char *)td->vm_mru[k].base &&
+                base < (const char *)td->vm_mru[k].end && !(td->vm_mru[k].protect & SEC_RESERVE))
+            {
+                const char *mru_base = td->vm_mru[k].base;
+                const char *mru_end = td->vm_mru[k].end;
+                unsigned int mru_prot = td->vm_mru[k].protect;
+                BYTE vprot;
+
+                local.BaseAddress = base;
+                local.AllocationBase = (void *)mru_base;
+                local.RegionSize = get_vprot_range_size( base, mru_end - base, ~VPROT_WRITEWATCH, &vprot );
+                local.State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
+                local.Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, mru_prot ) : 0;
+                local.AllocationProtect = get_win32_prot( mru_prot, mru_prot );
+                if (mru_prot & SEC_IMAGE) local.Type = MEM_IMAGE;
+                else if (mru_prot & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) local.Type = MEM_MAPPED;
+                else local.Type = MEM_PRIVATE;
+
+                __atomic_thread_fence( __ATOMIC_ACQUIRE );
+                if (seq1 == __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ))
+                {
+                    if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
+                    *info = local;
+                    return STATUS_SUCCESS;
+                }
+                break;
+            }
+        }
+    }
+
+    /* Find the view containing the address */
+
+    if (stats)
+    {
         virtual_read_sig_enter( &sigset );
         ts0 = victory_vm_now_ns();
         acquired = virtual_fault_read_enter();
@@ -6703,6 +6748,7 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
         if (view->protect & SEC_IMAGE) local.Type = MEM_IMAGE;
         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) local.Type = MEM_MAPPED;
         else local.Type = MEM_PRIVATE;
+        vm_mru_insert( td, __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ), view );
     }
     virtual_read_leave( acquired, &sigset );
     if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
@@ -7811,7 +7857,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
     if (use_kernel_writewatch && !enable_write_exceptions)
     {
         struct pm_scan_arg arg = { 0 };
-        struct page_region rgns[256];
+        struct page_region rgns[32];
         SIZE_T buffer_len = *count;
         ULONG_PTR out_count = 0;
         char *addr = ROUND_ADDR( base, host_page_mask );
