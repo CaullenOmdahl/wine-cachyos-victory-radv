@@ -2123,7 +2123,7 @@ static void dump_memory_statistics(void)
  */
 static inline void vm_mru_insert( struct ntdll_thread_data *td, UINT32 seq, struct file_view *view )
 {
-    unsigned int slot;
+    unsigned int i, slot;
 
     if (seq & 1) return;
     if (td->vm_mru_seq != seq)
@@ -2132,11 +2132,41 @@ static inline void vm_mru_insert( struct ntdll_thread_data *td, UINT32 seq, stru
         td->vm_mru_seq = seq;
         td->vm_mru_next = 0;
     }
+    for (i = 0; i < 4; i++)
+    {
+        if (td->vm_mru[i].view == view)
+        {
+            td->vm_mru[i].base = view->base;
+            td->vm_mru[i].end = (const char *)view->base + view->size;
+            td->vm_mru[i].protect = view->protect;
+            return;
+        }
+    }
     slot = td->vm_mru_next++ & 3;
     td->vm_mru[slot].base = view->base;
     td->vm_mru[slot].end = (const char *)view->base + view->size;
     td->vm_mru[slot].view = view;
     td->vm_mru[slot].protect = view->protect;
+}
+
+static inline void ww_neg_mru_insert( struct ntdll_thread_data *td, UINT32 seq, const void *base, const void *end )
+{
+    unsigned int i, slot;
+
+    if ((seq & 1) || end <= base) return;
+    if (td->ww_neg_seq != seq)
+    {
+        memset( td->ww_neg_mru, 0, sizeof(td->ww_neg_mru) );
+        td->ww_neg_seq = seq;
+        td->ww_neg_next = 0;
+    }
+    for (i = 0; i < 4; i++)
+    {
+        if (td->ww_neg_mru[i].base == base && td->ww_neg_mru[i].end == end) return;
+    }
+    slot = td->ww_neg_next++ & 3;
+    td->ww_neg_mru[slot].base = base;
+    td->ww_neg_mru[slot].end = end;
 }
 
 static struct file_view *find_view( const void *addr, size_t size )
@@ -6812,6 +6842,8 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
     sigset_t sigset;
     SIZE_T size;
     ULONGLONG t0 = 0, ts0 = 0;
+    UINT32 seq1;
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
     int stats = (process == NtCurrentProcess()) && victory_vm_stats_enabled();
     int acquired;
 
@@ -6832,6 +6864,58 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
     {
         t0 = victory_vm_now_ns();
         VVM_INC( qv_mri_calls );
+    }
+
+    seq1 = __atomic_load_n( &vm_tree_seq, __ATOMIC_ACQUIRE );
+    if (!(seq1 & 1) && td->vm_mru_seq == seq1)
+    {
+        unsigned int k;
+        for (k = 0; k < 4; k++)
+        {
+            if (td->vm_mru[k].view && base >= (const char *)td->vm_mru[k].base &&
+                base < (const char *)td->vm_mru[k].end && !(td->vm_mru[k].protect & SEC_RESERVE))
+            {
+                const char *mru_base = td->vm_mru[k].base;
+                const char *mru_end = td->vm_mru[k].end;
+                unsigned int mru_prot = td->vm_mru[k].protect;
+                int mru_valloc = !(mru_prot & (SEC_FILE | SEC_RESERVE | SEC_COMMIT));
+
+                local.AllocationBase = (void *)mru_base;
+                local.AllocationProtect = get_win32_prot( mru_prot, mru_prot );
+                local.RegionType = 0;
+                if (mru_valloc) local.Private = 1;
+                else if (mru_prot & SEC_IMAGE) local.MappedImage = 1;
+                else if (mru_prot & SEC_FILE) local.MappedDataFile = 1;
+                else local.MappedPageFile = 1;
+                if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, CommitSize))
+                    local.RegionSize = (size_t)(mru_end - mru_base);
+                if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, PartitionId))
+                {
+                    const char *p = mru_base;
+                    vprot_mask = VPROT_COMMITTED;
+                    if (!mru_valloc) vprot_mask |= PAGE_WRITECOPY;
+                    local.CommitSize = 0;
+                    while (p < mru_end &&
+                           (size = get_vprot_range_size( (void *)p, mru_end - p, vprot_mask, &vprot )))
+                    {
+                        if ((vprot & vprot_mask) == vprot_mask) local.CommitSize += size;
+                        p += size;
+                    }
+                }
+
+                __atomic_thread_fence( __ATOMIC_ACQUIRE );
+                if (seq1 == __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ))
+                {
+                    if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
+                    goto fill_info;
+                }
+                break;
+            }
+        }
+    }
+
+    if (stats)
+    {
         virtual_read_sig_enter( &sigset );
         ts0 = victory_vm_now_ns();
         acquired = virtual_fault_read_enter();
@@ -6868,6 +6952,8 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
             }
             if (view->protect & SEC_RESERVE) vm_prot_unlock_range( lock_base, lock_size );
         }
+        if (!(view->protect & SEC_RESERVE))
+            vm_mru_insert( td, __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ), view );
     }
     else
     {
@@ -6887,6 +6973,7 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
     virtual_read_leave( acquired, &sigset );
     if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
 
+fill_info:
     info->AllocationBase = local.AllocationBase;
     info->AllocationProtect = local.AllocationProtect;
     info->RegionType = local.RegionType;
@@ -7878,19 +7965,46 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
         arg.return_mask = PAGE_IS_WRITTEN;
 
         mru_seq1 = __atomic_load_n( &vm_tree_seq, __ATOMIC_ACQUIRE );
-        if (!(mru_seq1 & 1) && td->vm_mru_seq == mru_seq1 && (const char *)base + size >= (const char *)base)
+        if (!(mru_seq1 & 1) && (const char *)base + size >= (const char *)base)
         {
             unsigned int k;
-            for (k = 0; k < 4; k++)
+            if (td->vm_mru_seq == mru_seq1)
             {
-                if (td->vm_mru[k].view && base >= td->vm_mru[k].base &&
-                    (const char *)base + size <= (const char *)td->vm_mru[k].end)
+                for (k = 0; k < 4; k++)
                 {
-                    unsigned int mru_prot = td->vm_mru[k].protect;
-                    __atomic_thread_fence( __ATOMIC_ACQUIRE );
-                    if (mru_seq1 == __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ))
+                    if (td->vm_mru[k].view && base >= td->vm_mru[k].base &&
+                        (const char *)base + size <= (const char *)td->vm_mru[k].end)
                     {
-                        if (!(mru_prot & VPROT_WRITEWATCH))
+                        unsigned int mru_prot = td->vm_mru[k].protect;
+                        __atomic_thread_fence( __ATOMIC_ACQUIRE );
+                        if (mru_seq1 == __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ))
+                        {
+                            if (!(mru_prot & VPROT_WRITEWATCH))
+                            {
+                                if (stats)
+                                {
+                                    VVM_INC( ww_fail );
+                                    VVM_ADD( ww_total_ns, victory_vm_now_ns() - t0 );
+                                    victory_vm_maybe_report();
+                                }
+                                return STATUS_INVALID_PARAMETER;
+                            }
+                            ww_validated = 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!ww_validated && td->ww_neg_seq == mru_seq1)
+            {
+                for (k = 0; k < 4; k++)
+                {
+                    if (td->ww_neg_mru[k].end > td->ww_neg_mru[k].base &&
+                        base >= td->ww_neg_mru[k].base &&
+                        (const char *)base + size <= (const char *)td->ww_neg_mru[k].end)
+                    {
+                        __atomic_thread_fence( __ATOMIC_ACQUIRE );
+                        if (mru_seq1 == __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED ))
                         {
                             if (stats)
                             {
@@ -7900,15 +8014,16 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
                             }
                             return STATUS_INVALID_PARAMETER;
                         }
-                        ww_validated = 1;
+                        break;
                     }
-                    break;
                 }
             }
         }
 
         if (!ww_validated)
         {
+            struct file_view *ww_view;
+
             if (stats)
             {
                 t1 = victory_vm_now_ns();
@@ -7920,8 +8035,15 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
             }
             else acquired = virtual_read_enter( &sigset );
 
-            if (!is_write_watch_range( base, size ))
+            ww_view = find_view( base, size );
+            if (!ww_view || !(ww_view->protect & VPROT_WRITEWATCH))
             {
+                UINT32 cur_seq = __atomic_load_n( &vm_tree_seq, __ATOMIC_RELAXED );
+                if (ww_view)
+                    ww_neg_mru_insert( td, cur_seq, ww_view->base, (const char *)ww_view->base + ww_view->size );
+                else if ((const char *)base + size > (const char *)base)
+                    ww_neg_mru_insert( td, cur_seq, base, (const char *)base + size );
+
                 virtual_fault_read_leave( acquired );
                 if (stats)
                 {

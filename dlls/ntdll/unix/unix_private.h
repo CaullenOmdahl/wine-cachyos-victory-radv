@@ -131,6 +131,13 @@ struct ntdll_thread_data
         void         *view;
         unsigned int  protect;
     }                         vm_mru[4];
+    UINT32                    ww_neg_seq;
+    unsigned int              ww_neg_next;
+    struct
+    {
+        const void   *base;
+        const void   *end;
+    }                         ww_neg_mru[4];
 };
 
 #define VM_SIG_USR1 0x01
