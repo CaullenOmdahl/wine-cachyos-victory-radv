@@ -374,6 +374,7 @@ struct vulkan_funcs
     PFN_vkImportFenceWin32HandleKHR p_vkImportFenceWin32HandleKHR;
     PFN_vkImportSemaphoreWin32HandleKHR p_vkImportSemaphoreWin32HandleKHR;
     PFN_vkMapMemory p_vkMapMemory;
+    PFN_vkMapMemory2 p_vkMapMemory2;
     PFN_vkMapMemory2KHR p_vkMapMemory2KHR;
     PFN_vkQueuePresentKHR p_vkQueuePresentKHR;
     PFN_vkSetLatencySleepModeNV p_vkSetLatencySleepModeNV;
@@ -381,6 +382,7 @@ struct vulkan_funcs
     PFN_vkQueueSubmit2 p_vkQueueSubmit2;
     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
     PFN_vkUnmapMemory p_vkUnmapMemory;
+    PFN_vkUnmapMemory2 p_vkUnmapMemory2;
     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
     PFN_vkGetSemaphoreCounterValue p_vkGetSemaphoreCounterValue;
     PFN_vkGetSemaphoreCounterValueKHR p_vkGetSemaphoreCounterValueKHR;

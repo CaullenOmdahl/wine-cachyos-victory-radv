@@ -1881,7 +1881,7 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         return VK_SUCCESS;
     }
 
-    if (physical_device->map_placed_align)
+    if (physical_device->map_placed_align && !(info.flags & VK_MEMORY_MAP_PLACED_BIT_EXT))
     {
         SIZE_T alloc_size = memory->size;
 
@@ -1901,6 +1901,8 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
 
     if (device->p_vkMapMemory2KHR)
         res = device->p_vkMapMemory2KHR( device->host.device, &info, data );
+    else if (device->p_vkMapMemory2)
+        res = device->p_vkMapMemory2( device->host.device, &info, data );
     else
     {
         if (info.pNext) FIXME( "struct extension chain not implemented!\n" );
@@ -1959,7 +1961,7 @@ static VkResult win32u_vkUnmapMemory2KHR( VkDevice client_device, const VkMemory
 
     if (memory->vm_map && physical_device->external_memory_align) return VK_SUCCESS;
 
-    if (!device->p_vkUnmapMemory2KHR)
+    if (!device->p_vkUnmapMemory2KHR && !device->p_vkUnmapMemory2)
     {
         if (unmap_info->pNext || memory->vm_map) FIXME( "Not implemented\n" );
         device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
@@ -1970,7 +1972,10 @@ static VkResult win32u_vkUnmapMemory2KHR( VkDevice client_device, const VkMemory
     info.memory = memory->obj.host.device_memory;
     if (memory->vm_map) info.flags |= VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
 
-    res = device->p_vkUnmapMemory2KHR( device->host.device, &info );
+    if (device->p_vkUnmapMemory2KHR)
+        res = device->p_vkUnmapMemory2KHR( device->host.device, &info );
+    else
+        res = device->p_vkUnmapMemory2( device->host.device, &info );
 
     if (res == VK_SUCCESS && memory->vm_map)
     {
@@ -5165,6 +5170,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkImportFenceWin32HandleKHR = win32u_vkImportFenceWin32HandleKHR,
     .p_vkImportSemaphoreWin32HandleKHR = win32u_vkImportSemaphoreWin32HandleKHR,
     .p_vkMapMemory = win32u_vkMapMemory,
+    .p_vkMapMemory2 = win32u_vkMapMemory2KHR,
     .p_vkMapMemory2KHR = win32u_vkMapMemory2KHR,
     .p_vkQueuePresentKHR = win32u_vkQueuePresentKHR,
     .p_vkSetLatencySleepModeNV = win32u_vkSetLatencySleepModeNV,
@@ -5172,6 +5178,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkQueueSubmit2 = win32u_vkQueueSubmit2,
     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
     .p_vkUnmapMemory = win32u_vkUnmapMemory,
+    .p_vkUnmapMemory2 = win32u_vkUnmapMemory2KHR,
     .p_vkUnmapMemory2KHR = win32u_vkUnmapMemory2KHR,
     .p_vkGetSemaphoreCounterValue = win32u_vkGetSemaphoreCounterValue,
     .p_vkGetSemaphoreCounterValueKHR = win32u_vkGetSemaphoreCounterValueKHR,
