@@ -122,6 +122,15 @@ struct ntdll_thread_data
     unsigned int              vm_read_depth;
     unsigned int              vm_pending_sigs;
     LONGLONG                  creation_time;
+    UINT32                    vm_mru_seq;
+    unsigned int              vm_mru_next;
+    struct
+    {
+        const void   *base;
+        const void   *end;
+        void         *view;
+        unsigned int  protect;
+    }                         vm_mru[4];
 };
 
 #define VM_SIG_USR1 0x01
