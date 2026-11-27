@@ -32,6 +32,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <time.h>
+#include <limits.h>
+#if defined(__AVX2__) && defined(__x86_64__)
+# include <immintrin.h>
+#endif
+#ifdef __linux__
+# include <linux/futex.h>
+#endif
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -107,6 +115,151 @@ WINE_DECLARE_DEBUG_CHANNEL(virtstat);
 
 /* Gdb integration, in loader/main.c */
 static struct r_debug *wine_r_debug;
+
+static int victory_vm_stats_state = -1;
+
+static inline int victory_vm_stats_enabled(void)
+{
+    int s = __atomic_load_n( &victory_vm_stats_state, __ATOMIC_RELAXED );
+    if (__builtin_expect( s < 0, 0 ))
+    {
+        const char *env = getenv( "WINE_VICTORY_STATS" );
+        s = (env && env[0] == '1' && !env[1]) ? 1 : 0;
+        __atomic_store_n( &victory_vm_stats_state, s, __ATOMIC_RELAXED );
+    }
+    return s;
+}
+
+static inline ULONGLONG victory_vm_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000000000ULL + (ULONGLONG)ts.tv_nsec;
+}
+
+static struct
+{
+    ULONGLONG last_report_ns;
+    ULONGLONG ww_calls;
+    ULONGLONG ww_fail;
+    ULONGLONG ww_zero;
+    ULONGLONG ww_dirty_pages;
+    ULONGLONG ww_pages_checked;
+    ULONGLONG ww_ioctls;
+    ULONGLONG ww_rgns_multi;
+    ULONGLONG ww_sig_ns;
+    ULONGLONG ww_lock_ns;
+    ULONGLONG ww_scan_ns;
+    ULONGLONG ww_total_ns;
+    ULONGLONG rww_calls;
+    ULONGLONG rww_lock_ns;
+    ULONGLONG rww_total_ns;
+    ULONGLONG prot_calls;
+    ULONGLONG prot_ro_calls;
+    ULONGLONG prot_rw_calls;
+    ULONGLONG prot_pages;
+    ULONGLONG prot_lock_ns;
+    ULONGLONG prot_mprotect_ns;
+    ULONGLONG prot_total_ns;
+    ULONGLONG qv_mbi_calls;
+    ULONGLONG qv_mri_calls;
+    ULONGLONG qv_lock_ns;
+    ULONGLONG qv_total_ns;
+    ULONGLONG sec_reserve_rpcs;
+    ULONGLONG fault_calls;
+    ULONGLONG fault_guard;
+    ULONGLONG fault_ww;
+    ULONGLONG fault_av_user;
+    ULONGLONG fault_lock_ns;
+    ULONGLONG fault_total_ns;
+} victory_vm_stats;
+
+#define VVM_INC(field)       __atomic_fetch_add( &victory_vm_stats.field, 1, __ATOMIC_RELAXED )
+#define VVM_ADD(field, val)  __atomic_fetch_add( &victory_vm_stats.field, (ULONGLONG)(val), __ATOMIC_RELAXED )
+
+static int use_kernel_writewatch;
+
+static void victory_vm_maybe_report(void)
+{
+    ULONGLONG now, prev, dt;
+    char buf[512];
+    int len;
+    ULONGLONG ww_calls, ww_fail, ww_zero, ww_dirty_pages, ww_pages_checked, ww_ioctls, ww_multi;
+    ULONGLONG ww_sig_ns, ww_lock_ns, ww_scan_ns, ww_total_ns;
+    ULONGLONG rww_calls, rww_lock_ns, rww_total_ns;
+    ULONGLONG prot_calls, prot_ro, prot_rw, prot_pages, prot_lock_ns, prot_mp_ns, prot_total_ns;
+    ULONGLONG qv_mbi, qv_mri, qv_lock_ns, qv_total_ns, sec_rpcs;
+    ULONGLONG f_calls, f_guard, f_ww, f_av, f_lock_ns, f_total_ns;
+
+    if (!victory_vm_stats_enabled()) return;
+    now = victory_vm_now_ns();
+    prev = __atomic_load_n( &victory_vm_stats.last_report_ns, __ATOMIC_RELAXED );
+    if (!prev)
+    {
+        __atomic_compare_exchange_n( &victory_vm_stats.last_report_ns, &prev, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+        return;
+    }
+    if (now - prev < 5000000000ULL) return;
+    if (!__atomic_compare_exchange_n( &victory_vm_stats.last_report_ns, &prev, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED )) return;
+    dt = now - prev;
+
+    ww_calls = __atomic_exchange_n( &victory_vm_stats.ww_calls, 0, __ATOMIC_RELAXED );
+    ww_fail = __atomic_exchange_n( &victory_vm_stats.ww_fail, 0, __ATOMIC_RELAXED );
+    ww_zero = __atomic_exchange_n( &victory_vm_stats.ww_zero, 0, __ATOMIC_RELAXED );
+    ww_dirty_pages = __atomic_exchange_n( &victory_vm_stats.ww_dirty_pages, 0, __ATOMIC_RELAXED );
+    ww_pages_checked = __atomic_exchange_n( &victory_vm_stats.ww_pages_checked, 0, __ATOMIC_RELAXED );
+    ww_ioctls = __atomic_exchange_n( &victory_vm_stats.ww_ioctls, 0, __ATOMIC_RELAXED );
+    ww_multi = __atomic_exchange_n( &victory_vm_stats.ww_rgns_multi, 0, __ATOMIC_RELAXED );
+    ww_sig_ns = __atomic_exchange_n( &victory_vm_stats.ww_sig_ns, 0, __ATOMIC_RELAXED );
+    ww_lock_ns = __atomic_exchange_n( &victory_vm_stats.ww_lock_ns, 0, __ATOMIC_RELAXED );
+    ww_scan_ns = __atomic_exchange_n( &victory_vm_stats.ww_scan_ns, 0, __ATOMIC_RELAXED );
+    ww_total_ns = __atomic_exchange_n( &victory_vm_stats.ww_total_ns, 0, __ATOMIC_RELAXED );
+
+    rww_calls = __atomic_exchange_n( &victory_vm_stats.rww_calls, 0, __ATOMIC_RELAXED );
+    rww_lock_ns = __atomic_exchange_n( &victory_vm_stats.rww_lock_ns, 0, __ATOMIC_RELAXED );
+    rww_total_ns = __atomic_exchange_n( &victory_vm_stats.rww_total_ns, 0, __ATOMIC_RELAXED );
+
+    prot_calls = __atomic_exchange_n( &victory_vm_stats.prot_calls, 0, __ATOMIC_RELAXED );
+    prot_ro = __atomic_exchange_n( &victory_vm_stats.prot_ro_calls, 0, __ATOMIC_RELAXED );
+    prot_rw = __atomic_exchange_n( &victory_vm_stats.prot_rw_calls, 0, __ATOMIC_RELAXED );
+    prot_pages = __atomic_exchange_n( &victory_vm_stats.prot_pages, 0, __ATOMIC_RELAXED );
+    prot_lock_ns = __atomic_exchange_n( &victory_vm_stats.prot_lock_ns, 0, __ATOMIC_RELAXED );
+    prot_mp_ns = __atomic_exchange_n( &victory_vm_stats.prot_mprotect_ns, 0, __ATOMIC_RELAXED );
+    prot_total_ns = __atomic_exchange_n( &victory_vm_stats.prot_total_ns, 0, __ATOMIC_RELAXED );
+
+    qv_mbi = __atomic_exchange_n( &victory_vm_stats.qv_mbi_calls, 0, __ATOMIC_RELAXED );
+    qv_mri = __atomic_exchange_n( &victory_vm_stats.qv_mri_calls, 0, __ATOMIC_RELAXED );
+    qv_lock_ns = __atomic_exchange_n( &victory_vm_stats.qv_lock_ns, 0, __ATOMIC_RELAXED );
+    qv_total_ns = __atomic_exchange_n( &victory_vm_stats.qv_total_ns, 0, __ATOMIC_RELAXED );
+    sec_rpcs = __atomic_exchange_n( &victory_vm_stats.sec_reserve_rpcs, 0, __ATOMIC_RELAXED );
+
+    f_calls = __atomic_exchange_n( &victory_vm_stats.fault_calls, 0, __ATOMIC_RELAXED );
+    f_guard = __atomic_exchange_n( &victory_vm_stats.fault_guard, 0, __ATOMIC_RELAXED );
+    f_ww = __atomic_exchange_n( &victory_vm_stats.fault_ww, 0, __ATOMIC_RELAXED );
+    f_av = __atomic_exchange_n( &victory_vm_stats.fault_av_user, 0, __ATOMIC_RELAXED );
+    f_lock_ns = __atomic_exchange_n( &victory_vm_stats.fault_lock_ns, 0, __ATOMIC_RELAXED );
+    f_total_ns = __atomic_exchange_n( &victory_vm_stats.fault_total_ns, 0, __ATOMIC_RELAXED );
+
+    len = snprintf( buf, sizeof(buf),
+        "[ntdll-victory-stats] dt=%.2fs uffd=%d | ww calls=%llu (fail=%llu zero=%llu dirty_pg=%llu chk_mb=%llu ioctl=%llu multi=%llu) ms(tot=%.1f sig=%.1f lock=%.1f scan=%.1f) | rww=%llu ms(tot=%.1f lock=%.1f)\n",
+        dt / 1e9, use_kernel_writewatch,
+        (unsigned long long)ww_calls, (unsigned long long)ww_fail, (unsigned long long)ww_zero,
+        (unsigned long long)ww_dirty_pages, (unsigned long long)(ww_pages_checked >> 8),
+        (unsigned long long)ww_ioctls, (unsigned long long)ww_multi,
+        ww_total_ns / 1e6, ww_sig_ns / 1e6, ww_lock_ns / 1e6, ww_scan_ns / 1e6,
+        (unsigned long long)rww_calls, rww_total_ns / 1e6, rww_lock_ns / 1e6 );
+    if (len > 0) write( 2, buf, (size_t)len < sizeof(buf) ? (size_t)len : sizeof(buf) - 1 );
+
+    len = snprintf( buf, sizeof(buf),
+        "[ntdll-victory-stats] prot calls=%llu (ro=%llu rw=%llu pg=%llu) ms(tot=%.1f lock=%.1f mprot=%.1f) | qv mbi=%llu mri=%llu ms(tot=%.1f lock=%.1f) sec_rpc=%llu | fault=%llu (grd=%llu ww=%llu av=%llu) ms(tot=%.1f lock=%.1f)\n",
+        (unsigned long long)prot_calls, (unsigned long long)prot_ro, (unsigned long long)prot_rw,
+        (unsigned long long)prot_pages, prot_total_ns / 1e6, prot_lock_ns / 1e6, prot_mp_ns / 1e6,
+        (unsigned long long)qv_mbi, (unsigned long long)qv_mri, qv_total_ns / 1e6, qv_lock_ns / 1e6,
+        (unsigned long long)sec_rpcs,
+        (unsigned long long)f_calls, (unsigned long long)f_guard, (unsigned long long)f_ww, (unsigned long long)f_av,
+        f_total_ns / 1e6, f_lock_ns / 1e6 );
+    if (len > 0) write( 2, buf, (size_t)len < sizeof(buf) ? (size_t)len : sizeof(buf) - 1 );
+}
 
 #if defined(HAVE_LINK_H) || defined(HAVE_SYS_LINK_H)
 
@@ -294,6 +447,238 @@ static const BYTE VIRTUAL_Win32Flags[16] =
 
 static struct wine_rb_tree views_tree;
 static pthread_mutex_t virtual_mutex;
+
+#define VM_PROT_STRIPE_SHIFT 21 /* 2 MiB stripes */
+#define VM_PROT_STRIPES      128
+static pthread_mutex_t vm_prot_stripes[VM_PROT_STRIPES];
+
+static inline void vm_prot_lock_range( const void *base, size_t size )
+{
+    size_t first, last, count, i;
+
+    if (!size) return;
+    first = (uintptr_t)base >> VM_PROT_STRIPE_SHIFT;
+    last = ((uintptr_t)base + size - 1) >> VM_PROT_STRIPE_SHIFT;
+    count = last - first + 1;
+    if (count == 1)
+    {
+        mutex_lock( &vm_prot_stripes[first & (VM_PROT_STRIPES - 1)] );
+        return;
+    }
+    if (count >= VM_PROT_STRIPES)
+    {
+        for (i = 0; i < VM_PROT_STRIPES; i++) mutex_lock( &vm_prot_stripes[i] );
+        return;
+    }
+    first &= (VM_PROT_STRIPES - 1);
+    last &= (VM_PROT_STRIPES - 1);
+    if (first <= last)
+    {
+        for (i = first; i <= last; i++) mutex_lock( &vm_prot_stripes[i] );
+    }
+    else
+    {
+        for (i = 0; i <= last; i++) mutex_lock( &vm_prot_stripes[i] );
+        for (i = first; i < VM_PROT_STRIPES; i++) mutex_lock( &vm_prot_stripes[i] );
+    }
+}
+
+static inline void vm_prot_unlock_range( const void *base, size_t size )
+{
+    size_t first, last, count, i;
+
+    if (!size) return;
+    first = (uintptr_t)base >> VM_PROT_STRIPE_SHIFT;
+    last = ((uintptr_t)base + size - 1) >> VM_PROT_STRIPE_SHIFT;
+    count = last - first + 1;
+    if (count == 1)
+    {
+        mutex_unlock( &vm_prot_stripes[first & (VM_PROT_STRIPES - 1)] );
+        return;
+    }
+    if (count >= VM_PROT_STRIPES)
+    {
+        for (i = VM_PROT_STRIPES; i > 0; i--) mutex_unlock( &vm_prot_stripes[i - 1] );
+        return;
+    }
+    first &= (VM_PROT_STRIPES - 1);
+    last &= (VM_PROT_STRIPES - 1);
+    if (first <= last)
+    {
+        for (i = last + 1; i > first; i--) mutex_unlock( &vm_prot_stripes[i - 1] );
+    }
+    else
+    {
+        for (i = VM_PROT_STRIPES; i > first; i--) mutex_unlock( &vm_prot_stripes[i - 1] );
+        for (i = last + 1; i > 0; i--) mutex_unlock( &vm_prot_stripes[i - 1] );
+    }
+}
+
+#define VM_READERS_MASK   0x3fffffffU
+#define VM_WRITER_WAIT    0x40000000U
+#define VM_WRITER_ACTIVE  0x80000000U
+
+static UINT32 vm_tree_state;
+static UINT32 vm_writer_futex;
+static UINT_PTR vm_writer_tid;
+static unsigned int vm_writer_depth;
+
+static inline void vm_futex_wait( UINT32 *addr, UINT32 val )
+{
+#ifdef __linux__
+    syscall( __NR_futex, addr, FUTEX_WAIT_PRIVATE, val, NULL, NULL, 0 );
+#else
+    sched_yield();
+#endif
+}
+
+static inline void vm_futex_wake( UINT32 *addr, int count )
+{
+#ifdef __linux__
+    syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, count, NULL, NULL, 0 );
+#endif
+}
+
+/* Caller holds virtual_mutex and server_block_set. Uses a separate writer
+ * futex with seq_cst Dekker ordering so waiting readers and the waiting
+ * writer never contend on the same wait queue. */
+static void virtual_write_lock_only(void)
+{
+    UINT_PTR self = (UINT_PTR)pthread_self();
+
+    if (vm_writer_depth == 0)
+    {
+        __atomic_fetch_or( &vm_tree_state, VM_WRITER_WAIT, __ATOMIC_SEQ_CST );
+        while ((__atomic_load_n( &vm_tree_state, __ATOMIC_SEQ_CST ) & VM_READERS_MASK) != 0)
+        {
+            __atomic_store_n( &vm_writer_futex, 1, __ATOMIC_SEQ_CST );
+            if ((__atomic_load_n( &vm_tree_state, __ATOMIC_SEQ_CST ) & VM_READERS_MASK) == 0) break;
+            vm_futex_wait( &vm_writer_futex, 1 );
+        }
+        __atomic_store_n( &vm_writer_futex, 0, __ATOMIC_RELAXED );
+        __atomic_store_n( &vm_tree_state, VM_WRITER_ACTIVE, __ATOMIC_RELEASE );
+        __atomic_store_n( &vm_writer_tid, self, __ATOMIC_RELAXED );
+    }
+    vm_writer_depth++;
+}
+
+static void virtual_write_unlock_only(void)
+{
+    if (--vm_writer_depth == 0)
+    {
+        __atomic_store_n( &vm_writer_tid, 0, __ATOMIC_RELAXED );
+        __atomic_store_n( &vm_tree_state, 0, __ATOMIC_SEQ_CST );
+        vm_futex_wake( &vm_tree_state, INT_MAX );
+    }
+}
+
+static void virtual_write_enter( sigset_t *sigset )
+{
+    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
+    mutex_lock( &virtual_mutex );
+    virtual_write_lock_only();
+}
+
+static void virtual_write_leave( sigset_t *sigset )
+{
+    virtual_write_unlock_only();
+    mutex_unlock( &virtual_mutex );
+    pthread_sigmask( SIG_SETMASK, sigset, NULL );
+}
+
+static void virtual_flush_pending_sigs( struct ntdll_thread_data *td )
+{
+    unsigned int sigs = __atomic_exchange_n( &td->vm_pending_sigs, 0, __ATOMIC_ACQ_REL );
+#ifdef __linux__
+    pid_t pid = getpid();
+    pid_t tid = syscall( __NR_gettid );
+    if (sigs & VM_SIG_QUIT) syscall( __NR_tgkill, pid, tid, SIGQUIT );
+    if (sigs & VM_SIG_INT)  syscall( __NR_tgkill, pid, tid, SIGINT );
+    if (sigs & VM_SIG_USR1) syscall( __NR_tgkill, pid, tid, SIGUSR1 );
+#else
+    pthread_t self = pthread_self();
+    if (sigs & VM_SIG_QUIT) pthread_kill( self, SIGQUIT );
+    if (sigs & VM_SIG_INT)  pthread_kill( self, SIGINT );
+    if (sigs & VM_SIG_USR1) pthread_kill( self, SIGUSR1 );
+#endif
+}
+
+static inline int virtual_fault_read_enter(void)
+{
+    UINT_PTR self = (UINT_PTR)pthread_self();
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
+    UINT32 s;
+
+    if (__atomic_load_n( &vm_writer_tid, __ATOMIC_RELAXED ) == self) return 0;
+    if (td->vm_read_depth > 0) return 0;
+    for (;;)
+    {
+        s = __atomic_load_n( &vm_tree_state, __ATOMIC_ACQUIRE );
+        if (!(s & (VM_WRITER_WAIT | VM_WRITER_ACTIVE)))
+        {
+            if (__atomic_compare_exchange_n( &vm_tree_state, &s, s + 1, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
+            {
+                td->vm_read_depth = 1;
+                return 1;
+            }
+        }
+        else vm_futex_wait( &vm_tree_state, s );
+    }
+}
+
+static inline void virtual_fault_read_leave( int acquired )
+{
+    UINT32 s;
+    if (!acquired) return;
+    ntdll_get_thread_data()->vm_read_depth = 0;
+    s = __atomic_sub_fetch( &vm_tree_state, 1, __ATOMIC_SEQ_CST );
+    if ((s & VM_WRITER_WAIT) && !(s & VM_READERS_MASK))
+    {
+        __atomic_store_n( &vm_writer_futex, 0, __ATOMIC_SEQ_CST );
+        vm_futex_wake( &vm_writer_futex, INT_MAX );
+    }
+}
+
+static inline void virtual_read_sig_enter( sigset_t *sigset )
+{
+#if defined(__x86_64__) && defined(__linux__)
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
+    td->vm_crit++;
+    __atomic_signal_fence( __ATOMIC_SEQ_CST );
+    (void)sigset;
+#else
+    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
+#endif
+}
+
+static inline void virtual_read_sig_leave( sigset_t *sigset )
+{
+#if defined(__x86_64__) && defined(__linux__)
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
+    __atomic_signal_fence( __ATOMIC_SEQ_CST );
+    if (--td->vm_crit == 0)
+    {
+        __atomic_signal_fence( __ATOMIC_SEQ_CST );
+        if (__builtin_expect( __atomic_load_n( &td->vm_pending_sigs, __ATOMIC_RELAXED ) != 0, 0 ))
+            virtual_flush_pending_sigs( td );
+    }
+    (void)sigset;
+#else
+    pthread_sigmask( SIG_SETMASK, sigset, NULL );
+#endif
+}
+
+static inline int virtual_read_enter( sigset_t *sigset )
+{
+    virtual_read_sig_enter( sigset );
+    return virtual_fault_read_enter();
+}
+
+static inline void virtual_read_leave( int acquired, sigset_t *sigset )
+{
+    virtual_fault_read_leave( acquired );
+    virtual_read_sig_leave( sigset );
+}
 
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
@@ -521,6 +906,11 @@ static void kernel_get_write_watches( void *base, SIZE_T size, void **buffer, UL
         {
             ERR( "ioctl( PAGEMAP_SCAN ) failed, error %s.\n", strerror(errno) );
             return;
+        }
+        if (victory_vm_stats_enabled())
+        {
+            VVM_INC( ww_ioctls );
+            if (rgn_count == ARRAY_SIZE(rgns)) VVM_INC( ww_rgns_multi );
         }
         if (!rgn_count) break;
 
@@ -958,13 +1348,13 @@ void *get_builtin_so_handle( void *module )
     void *ret = NULL;
     struct builtin_module *builtin;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if ((builtin = get_builtin_module( module )))
     {
         ret = builtin->handle;
         if (ret) builtin->refcount++;
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 
@@ -1014,7 +1404,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     struct builtin_module *builtin;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if ((builtin = get_builtin_module( module )))
     {
         if (builtin->unix_path && !builtin->unix_handle)
@@ -1026,7 +1416,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
         }
         if (builtin->unix_handle) status = get_unixlib_funcs( builtin->unix_handle, wow, funcs );
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -1040,7 +1430,7 @@ NTSTATUS set_builtin_unixlib_name( void *module, const char *name )
     NTSTATUS status = STATUS_SUCCESS;
     struct builtin_module *builtin;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if ((builtin = get_builtin_module( module )))
     {
         if (!builtin->unix_path) builtin->unix_path = strdup( name );
@@ -1051,7 +1441,7 @@ NTSTATUS set_builtin_unixlib_name( void *module, const char *name )
             builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
         }
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -1303,8 +1693,51 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
 
     TRACE("base %p, size %p, mask %#x.\n", base, (void *)size, mask);
 
+    if (!size)
+    {
+        *vprot = 0;
+        return 0;
+    }
+
     curr_idx = start_idx = (size_t)base >> page_shift;
     end_idx = start_idx + (size >> page_shift);
+
+#if defined(__AVX2__) && defined(__x86_64__)
+    {
+        BYTE first_vprot, target_byte;
+        __m256i target, vmask;
+
+        vprot_ptr = pages_vprot[curr_idx >> pages_vprot_shift] + (curr_idx & pages_vprot_mask);
+        first_vprot = __atomic_load_n( vprot_ptr, __ATOMIC_RELAXED );
+        *vprot = first_vprot;
+        target_byte = first_vprot & mask;
+        target = _mm256_set1_epi8( (char)target_byte );
+        vmask = _mm256_set1_epi8( (char)mask );
+
+        while (curr_idx < end_idx)
+        {
+            SIZE_T chunk_rem = (pages_vprot_mask + 1) - (curr_idx & pages_vprot_mask);
+            SIZE_T rem = end_idx - curr_idx;
+            if (rem > chunk_rem) rem = chunk_rem;
+            vprot_ptr = pages_vprot[curr_idx >> pages_vprot_shift] + (curr_idx & pages_vprot_mask);
+
+            while (rem >= 32)
+            {
+                __m256i v = _mm256_and_si256( _mm256_loadu_si256( (const __m256i *)vprot_ptr ), vmask );
+                unsigned int eq = (unsigned int)_mm256_movemask_epi8( _mm256_cmpeq_epi8( v, target ) );
+                if (eq != 0xffffffffU)
+                    return ((curr_idx + (unsigned)__builtin_ctz( ~eq )) - start_idx) << page_shift;
+                curr_idx += 32;
+                vprot_ptr += 32;
+                rem -= 32;
+            }
+            for (; rem; --rem, ++curr_idx, ++vprot_ptr)
+                if ((__atomic_load_n( vprot_ptr, __ATOMIC_RELAXED ) & mask) != target_byte)
+                    return (curr_idx - start_idx) << page_shift;
+        }
+        return size;
+    }
+#endif
 
     aligned_start_idx = ROUND_SIZE( 0, start_idx, index_align_mask );
     if (aligned_start_idx > end_idx) aligned_start_idx = end_idx;
@@ -1314,7 +1747,7 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
 #else
     vprot_ptr = pages_vprot + curr_idx;
 #endif
-    *vprot = *vprot_ptr;
+    *vprot = __atomic_load_n( vprot_ptr, __ATOMIC_RELAXED );
 
     /* Page count page table is at least the multiples of sizeof(UINT_PTR)
      * so we don't have to worry about crossing the boundary on unaligned idx values. */
@@ -1589,12 +2022,12 @@ static void VIRTUAL_Dump(void)
     struct file_view *view;
 
     TRACE( "Dump of all virtual memory views:\n" );
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
     {
         dump_view( view );
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 }
 #endif
 
@@ -2078,18 +2511,29 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    if (!size) return TRUE;
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
         set_page_vprot_bits( base, size, vprot & ~VPROT_WRITEWATCH, ~vprot & ~VPROT_WRITEWATCH );
+        return !mprotect_range( base, size, 0, 0 );
     }
     else
     {
+        BYTE cur_vprot;
         if (enable_write_exceptions && is_vprot_exec_write( vprot )) vprot |= VPROT_WRITEWATCH;
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
+        if (get_vprot_range_size( base, size, 0xff, &cur_vprot ) == size && cur_vprot == vprot)
+            return TRUE;
         set_page_vprot( base, size, vprot );
+#ifdef __x86_64__
+        return !mprotect_exec( ROUND_ADDR( base, host_page_mask ),
+                               ROUND_SIZE( base, size, host_page_mask ),
+                               get_unix_prot( vprot ) );
+#else
+        return !mprotect_range( base, size, 0, 0 );
+#endif
     }
-    return !mprotect_range( base, size, 0, 0 );
 }
 
 
@@ -2652,6 +3096,7 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
 
     if (view->protect & SEC_RESERVE)
     {
+        if (victory_vm_stats_enabled()) VVM_INC( sec_reserve_rpcs );
         size = 0;
 
         *vprot = get_page_vprot( base );
@@ -3652,7 +4097,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
         SERVER_END_REQ;
     }
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
     if (status) goto done;
@@ -3689,7 +4134,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     else delete_view( view );
 
 done:
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
     return status;
@@ -3796,7 +4241,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 
     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
     if (res) goto done;
@@ -3830,7 +4275,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     else delete_view( view );
 
 done:
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     if (needs_close) close( unix_handle );
     TRACE("status %#x.\n", res);
     return res;
@@ -3890,6 +4335,7 @@ void virtual_init(void)
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
     pthread_mutex_init( &virtual_mutex, &attr );
+    for (i = 0; i < VM_PROT_STRIPES; i++) pthread_mutex_init( &vm_prot_stripes[i], &attr );
     pthread_mutexattr_destroy( &attr );
 
 #ifdef __aarch64__
@@ -3906,6 +4352,14 @@ void virtual_init(void)
 #endif
 
     kernel_writewatch_init();
+    if (victory_vm_stats_enabled())
+    {
+        char initbuf[160];
+        int ilen = snprintf( initbuf, sizeof(initbuf),
+            "[ntdll-victory-stats] init uffd=%d page=%zu host=%zu force_exec=%d wr_exc=%d\n",
+            use_kernel_writewatch, page_size, host_page_size, force_exec_prot, enable_write_exceptions );
+        if (ilen > 0) write( 2, initbuf, (size_t)ilen < sizeof(initbuf) ? (size_t)ilen : sizeof(initbuf) - 1 );
+    }
 
     if (preload_info && *preload_info)
         for (i = 0; (*preload_info)[i].size; i++)
@@ -4110,7 +4564,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
     void *base = wine_server_get_ptr( info->base );
     int i;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     status = create_view( &view, base, size, SEC_IMAGE | SEC_FILE | VPROT_SYSTEM |
                           VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC );
     if (!status)
@@ -4147,7 +4601,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
         }
         else delete_view( view );
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 
     return status;
 }
@@ -4322,7 +4776,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
     NTSTATUS status = STATUS_SUCCESS;
     SIZE_T block_size = signal_stack_mask + 1;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (next_free_teb)
     {
         ptr = next_free_teb;
@@ -4338,7 +4792,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
                                                    &total, MEM_RESERVE, PAGE_READWRITE )))
             {
-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+                virtual_write_leave( &sigset );
                 return status;
             }
             teb_block = ptr;
@@ -4355,7 +4809,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
         *(void **)ptr = next_free_teb;
         next_free_teb = ptr;
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -4394,14 +4848,14 @@ void virtual_free_teb( TEB *teb )
         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
     }
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     signal_free_thread( teb );
     list_remove( &thread_data->entry );
     ptr = teb;
     if (!is_win64) ptr = (char *)ptr - teb_offset;
     *(void **)ptr = next_free_teb;
     next_free_teb = ptr;
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 }
 
 
@@ -4510,10 +4964,10 @@ NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, LDT_ENTRY entry1, ULONG sel2, LDT_E
     if (is_win64 && !is_wow64()) return STATUS_NOT_IMPLEMENTED;
     if (sel1 >> 16 || sel2 >> 16) return STATUS_INVALID_LDT_DESCRIPTOR;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (sel1) ldt_update_entry( sel1, entry1 );
     if (sel2) ldt_update_entry( sel2, entry2 );
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return STATUS_SUCCESS;
 }
 
@@ -4541,7 +4995,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 
     if (index < TLS_MINIMUM_AVAILABLE)
     {
-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        virtual_write_enter( &sigset );
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
@@ -4552,14 +5006,14 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 #endif
             teb->TlsSlots[index] = 0;
         }
-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        virtual_write_leave( &sigset );
     }
     else
     {
         index -= TLS_MINIMUM_AVAILABLE;
         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
 
-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        virtual_write_enter( &sigset );
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
@@ -4574,7 +5028,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 #endif
             if (teb->TlsExpansionSlots) teb->TlsExpansionSlots[index] = 0;
         }
-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        virtual_write_leave( &sigset );
     }
     return STATUS_SUCCESS;
 }
@@ -4659,7 +5113,7 @@ NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t )
     unsigned int idx = 0;
     sigset_t sigset;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     LIST_FOR_EACH_ENTRY_REV( thread_data, &teb_list, struct ntdll_thread_data, entry )
     {
         TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
@@ -4667,7 +5121,7 @@ NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t )
         if (idx == t->ThreadDataCount) break;
         if ((ret = virtual_set_tls_information_teb( t, &idx, teb ))) break;
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 
@@ -4690,7 +5144,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
     size = ROUND_SIZE( 0, size, granularity_mask );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
                        limit_low, limit_high, 0 );
@@ -4723,7 +5177,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     stack->StackBase = (char *)view->base + view->size;
     stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
 done:
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -4886,8 +5340,19 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     void *addr = (void *)rec->ExceptionInformation[1];
     char *page = ROUND_ADDR( addr, host_page_mask );
     BYTE vprot;
+    ULONGLONG t0 = 0, tl0 = 0, tl1 = 0;
+    int stats = victory_vm_stats_enabled();
+    int acquired;
 
-    mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
+    if (stats) t0 = victory_vm_now_ns();
+    if (stats) tl0 = victory_vm_now_ns();
+    acquired = virtual_fault_read_enter();
+    if (stats)
+    {
+        tl1 = victory_vm_now_ns();
+        VVM_INC( fault_calls );
+        VVM_ADD( fault_lock_ns, tl1 - tl0 );
+    }
     vprot = get_host_page_vprot( page );
 
 #ifdef __APPLE__
@@ -4899,41 +5364,64 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     }
 #endif
 
-    if (!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD))
+    if ((!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD)) ||
+        (err == EXCEPTION_WRITE_FAULT &&
+         ((vprot & VPROT_WRITEWATCH) || (get_unix_prot( vprot ) & PROT_WRITE))))
     {
         struct thread_stack_info stack_info;
-        if (!is_inside_thread_stack( page, &stack_info ))
+        void *lock_base = page;
+        size_t lock_size = host_page_size;
+
+        if (!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD) && is_inside_thread_stack( page, &stack_info ))
         {
-            set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
-            mprotect_range( page, host_page_size, 0, 0 );
-            ret = STATUS_GUARD_PAGE_VIOLATION;
+            lock_base = stack_info.start;
+            lock_size = (size_t)((char *)stack_info.end - (char *)stack_info.start);
         }
-        else ret = grow_thread_stack( page, &stack_info );
-    }
-    else if (err == EXCEPTION_WRITE_FAULT)
-    {
-        if (vprot & VPROT_WRITEWATCH)
+        vm_prot_lock_range( lock_base, lock_size );
+        vprot = get_host_page_vprot( page );
+        if (!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD))
         {
-            if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !ntdll_get_thread_data()->allow_writes)
+            if (!is_inside_thread_stack( page, &stack_info ))
             {
-                rec->NumberParameters = 3;
-                rec->ExceptionInformation[2] = STATUS_EXECUTABLE_MEMORY_WRITE;
-                ret = STATUS_IN_PAGE_ERROR;
-            }
-            else
-            {
-                set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
+                set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
                 mprotect_range( page, host_page_size, 0, 0 );
+                ret = STATUS_GUARD_PAGE_VIOLATION;
+            }
+            else ret = grow_thread_stack( page, &stack_info );
+        }
+        else if (err == EXCEPTION_WRITE_FAULT)
+        {
+            if (vprot & VPROT_WRITEWATCH)
+            {
+                if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !ntdll_get_thread_data()->allow_writes)
+                {
+                    rec->NumberParameters = 3;
+                    rec->ExceptionInformation[2] = STATUS_EXECUTABLE_MEMORY_WRITE;
+                    ret = STATUS_IN_PAGE_ERROR;
+                }
+                else
+                {
+                    set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
+                    mprotect_range( page, host_page_size, 0, 0 );
+                }
+            }
+            /* ignore fault if page is writable now */
+            if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
+            {
+                if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
+                    ret = STATUS_SUCCESS;
             }
         }
-        /* ignore fault if page is writable now */
-        if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
-        {
-            if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
-                ret = STATUS_SUCCESS;
-        }
+        vm_prot_unlock_range( lock_base, lock_size );
     }
-    mutex_unlock( &virtual_mutex );
+    virtual_fault_read_leave( acquired );
+    if (stats)
+    {
+        if (ret == STATUS_GUARD_PAGE_VIOLATION) VVM_INC( fault_guard );
+        else if (ret == STATUS_SUCCESS) VVM_INC( fault_ww );
+        else VVM_INC( fault_av_user );
+        VVM_ADD( fault_total_ns, victory_vm_now_ns() - t0 );
+    }
     rec->ExceptionCode = ret;
     return ret;
 }
@@ -4973,13 +5461,17 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
     else if (stack < stack_info.limit)
     {
         char *page = ROUND_ADDR( stack, host_page_mask );
-        mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
+        void *lock_base = stack_info.start;
+        size_t lock_size = (size_t)((char *)stack_info.end - (char *)stack_info.start);
+        int acquired = virtual_fault_read_enter();
+        vm_prot_lock_range( lock_base, lock_size );  /* no need for signal masking inside signal handler */
         if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( page, &stack_info ))
         {
             rec->ExceptionCode = STATUS_STACK_OVERFLOW;
             rec->NumberParameters = 0;
         }
-        mutex_unlock( &virtual_mutex );
+        vm_prot_unlock_range( lock_base, lock_size );
+        virtual_fault_read_leave( acquired );
     }
 #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
     VALGRIND_MAKE_MEM_UNDEFINED( stack, size );
@@ -5028,14 +5520,14 @@ unsigned int virtual_locked_server_call( void *req_ptr )
 
     if (!size) return wine_server_call( req_ptr );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!(ret = check_write_access( addr, size, &has_write_watch )))
     {
         ret = server_call_unlocked( req );
         if (has_write_watch) update_write_watches( addr, size, wine_server_reply_size( req ));
     }
     else memset( &req->u.reply, 0, sizeof(req->u.reply) );
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 
@@ -5052,14 +5544,14 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
     ssize_t ret = read( fd, addr, size );
     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
     {
         ret = read( fd, addr, size );
         err = errno;
         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     errno = err;
     return ret;
 }
@@ -5077,14 +5569,14 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
     ssize_t ret = pread( fd, addr, size, offset );
     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
     {
         ret = pread( fd, addr, size, offset );
         err = errno;
         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     errno = err;
     return ret;
 }
@@ -5103,7 +5595,7 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
     ssize_t ret = recvmsg( fd, hdr, flags );
     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     for (i = 0; i < hdr->msg_iovlen; i++)
         if (check_write_access( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))
             break;
@@ -5115,7 +5607,7 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
     if (has_write_watch)
         while (i--) update_write_watches( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     errno = err;
     return ret;
 }
@@ -5130,10 +5622,10 @@ BOOL virtual_is_valid_code_address( const void *addr, SIZE_T size )
     BOOL ret = FALSE;
     sigset_t sigset;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if ((view = find_view( addr, size )))
         ret = !(view->protect & VPROT_SYSTEM);  /* system views are not visible to the app */
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 
@@ -5220,7 +5712,7 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
 
     if (!size) return 0;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if ((view = find_view( addr, size )))
     {
         if (!(view->protect & VPROT_SYSTEM))
@@ -5236,7 +5728,7 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
             }
         }
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return bytes_read;
 }
 
@@ -5256,13 +5748,13 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
 
     if (!size) return STATUS_SUCCESS;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!(ret = check_write_access( addr, size, &has_write_watch )))
     {
         memcpy( addr, buffer, size );
         if (has_write_watch) update_write_watches( addr, size, size );
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 
@@ -5277,7 +5769,7 @@ void virtual_set_force_exec( BOOL enable )
     struct file_view *view;
     sigset_t sigset;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!force_exec_prot != !enable)  /* change all existing views */
     {
         force_exec_prot = enable;
@@ -5295,7 +5787,7 @@ void virtual_set_force_exec( BOOL enable )
             mprotect_range( view->base, view->size, commit, 0 );
         }
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 }
 
 
@@ -5307,7 +5799,7 @@ void virtual_enable_write_exceptions( BOOL enable )
     struct file_view *view;
     sigset_t sigset;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!enable_write_exceptions && enable)  /* change all existing views */
     {
         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
@@ -5315,7 +5807,7 @@ void virtual_enable_write_exceptions( BOOL enable )
                 mprotect_range( view->base, view->size, 0, 0 );
     }
     enable_write_exceptions = enable;
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 }
 
 
@@ -5478,7 +5970,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     /* Reserve the memory */
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     if ((type & MEM_RESERVE) || !base)
     {
@@ -5536,7 +6028,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         dump_memory_statistics();
     }
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 
     if (status == STATUS_SUCCESS)
     {
@@ -5790,7 +6282,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
     if (!base)
@@ -5830,14 +6322,14 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         break;
     }
 
+    dump_memory_statistics();
+    virtual_write_leave( &sigset );
+
     if (status == STATUS_SUCCESS)
     {
         *addr_ptr = base;
         *size_ptr = size;
     }
-
-    dump_memory_statistics();
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return status;
 }
 
@@ -5856,7 +6348,10 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     BYTE vprot;
     SIZE_T size = *size_ptr;
     LPVOID addr = *addr_ptr;
-    DWORD old;
+    DWORD old = 0;
+    ULONGLONG t0 = 0, ts0 = 0, ts1 = 0, tm0 = 0, tm1 = 0;
+    int stats = (process == NtCurrentProcess()) && victory_vm_stats_enabled();
+    int acquired;
 
     TRACE("%p %p %08lx %08x\n", process, addr, size, new_prot );
 
@@ -5892,7 +6387,25 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        t0 = victory_vm_now_ns();
+        VVM_INC( prot_calls );
+        if ((new_prot & 0xff) == PAGE_READONLY) VVM_INC( prot_ro_calls );
+        else if ((new_prot & 0xff) == PAGE_READWRITE) VVM_INC( prot_rw_calls );
+        VVM_ADD( prot_pages, size >> page_shift );
+        virtual_read_sig_enter( &sigset );
+        ts0 = victory_vm_now_ns();
+        acquired = virtual_fault_read_enter();
+        vm_prot_lock_range( base, size );
+        ts1 = victory_vm_now_ns();
+        VVM_ADD( prot_lock_ns, ts1 - ts0 );
+    }
+    else
+    {
+        acquired = virtual_read_enter( &sigset );
+        vm_prot_lock_range( base, size );
+    }
 
     if ((view = find_view( base, size )))
     {
@@ -5900,7 +6413,13 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
         {
             old = get_win32_prot( vprot, view->protect );
+            if (stats) tm0 = victory_vm_now_ns();
             status = set_protection( view, base, size, new_prot );
+            if (stats)
+            {
+                tm1 = victory_vm_now_ns();
+                VVM_ADD( prot_mprotect_ns, tm1 - tm0 );
+            }
 
             if (simulate_writecopy && status == STATUS_SUCCESS
                 && ((old == PAGE_WRITECOPY || old == PAGE_EXECUTE_WRITECOPY)))
@@ -5935,7 +6454,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    vm_prot_unlock_range( base, size );
+    virtual_read_leave( acquired, &sigset );
+    if (stats) VVM_ADD( prot_total_ns, victory_vm_now_ns() - t0 );
 
     if (status == STATUS_SUCCESS)
     {
@@ -6025,10 +6546,14 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
 
 static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFORMATION *info )
 {
+    MEMORY_BASIC_INFORMATION local;
     char *base, *alloc_base, *alloc_end;
     struct file_view *view;
     BOOL fake_reserved;
     sigset_t sigset;
+    ULONGLONG t0 = 0, ts0 = 0;
+    int stats = victory_vm_stats_enabled();
+    int acquired;
 
     base = ROUND_ADDR( addr, page_mask );
 
@@ -6036,48 +6561,66 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
 
     /* Find the view containing the address */
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        t0 = victory_vm_now_ns();
+        VVM_INC( qv_mbi_calls );
+        virtual_read_sig_enter( &sigset );
+        ts0 = victory_vm_now_ns();
+        acquired = virtual_fault_read_enter();
+        VVM_ADD( qv_lock_ns, victory_vm_now_ns() - ts0 );
+    }
+    else acquired = virtual_read_enter( &sigset );
+
     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
 
-    /* Fill the info structure */
+    /* Fill the local info structure */
 
-    info->BaseAddress = base;
-    info->RegionSize  = alloc_end - base;
+    local.BaseAddress = base;
+    local.RegionSize  = alloc_end - base;
 
     if (!view)
     {
         if (fake_reserved)
         {
-            info->State             = MEM_RESERVE;
-            info->Protect           = PAGE_NOACCESS;
-            info->AllocationBase    = alloc_base;
-            info->AllocationProtect = PAGE_NOACCESS;
-            info->Type              = MEM_PRIVATE;
+            local.State             = MEM_RESERVE;
+            local.Protect           = PAGE_NOACCESS;
+            local.AllocationBase    = alloc_base;
+            local.AllocationProtect = PAGE_NOACCESS;
+            local.Type              = MEM_PRIVATE;
         }
         else
         {
-            info->State             = MEM_FREE;
-            info->Protect           = PAGE_NOACCESS;
-            info->AllocationBase    = 0;
-            info->AllocationProtect = 0;
-            info->Type              = 0;
+            local.State             = MEM_FREE;
+            local.Protect           = PAGE_NOACCESS;
+            local.AllocationBase    = 0;
+            local.AllocationProtect = 0;
+            local.Type              = 0;
         }
     }
     else
     {
         BYTE vprot;
 
-        info->AllocationBase = alloc_base;
-        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
-        info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
-        info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
-        info->AllocationProtect = get_win32_prot( view->protect, view->protect );
-        if (view->protect & SEC_IMAGE) info->Type = MEM_IMAGE;
-        else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
-        else info->Type = MEM_PRIVATE;
+        local.AllocationBase = alloc_base;
+        if (view->protect & SEC_RESERVE)
+        {
+            vm_prot_lock_range( view->base, view->size );
+            local.RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
+            vm_prot_unlock_range( view->base, view->size );
+        }
+        else local.RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
+        local.State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
+        local.Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
+        local.AllocationProtect = get_win32_prot( view->protect, view->protect );
+        if (view->protect & SEC_IMAGE) local.Type = MEM_IMAGE;
+        else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) local.Type = MEM_MAPPED;
+        else local.Type = MEM_PRIVATE;
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_read_leave( acquired, &sigset );
+    if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
 
+    *info = local;
     return STATUS_SUCCESS;
 }
 
@@ -6128,12 +6671,16 @@ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
 static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY_REGION_INFORMATION *info,
                                             SIZE_T len, SIZE_T *res_len )
 {
+    MEMORY_REGION_INFORMATION local = { 0 };
     char *base, *region_start, *region_end;
     struct file_view *view;
     BYTE vprot, vprot_mask;
     BOOL fake_reserved;
     sigset_t sigset;
     SIZE_T size;
+    ULONGLONG t0 = 0, ts0 = 0;
+    int stats = (process == NtCurrentProcess()) && victory_vm_stats_enabled();
+    int acquired;
 
     if (len < FIELD_OFFSET(MEMORY_REGION_INFORMATION, CommitSize))
         return STATUS_INFO_LENGTH_MISMATCH;
@@ -6148,44 +6695,68 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
 
     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        t0 = victory_vm_now_ns();
+        VVM_INC( qv_mri_calls );
+        virtual_read_sig_enter( &sigset );
+        ts0 = victory_vm_now_ns();
+        acquired = virtual_fault_read_enter();
+        VVM_ADD( qv_lock_ns, victory_vm_now_ns() - ts0 );
+    }
+    else acquired = virtual_read_enter( &sigset );
 
     if ((view = get_memory_region_size( base, &region_start, &region_end, &fake_reserved )))
     {
-        info->AllocationBase = view->base;
-        info->AllocationProtect = get_win32_prot( view->protect, view->protect );
-        info->RegionType = 0; /* FIXME */
+        local.AllocationBase = view->base;
+        local.AllocationProtect = get_win32_prot( view->protect, view->protect );
+        local.RegionType = 0; /* FIXME */
         if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, CommitSize))
-            info->RegionSize = view->size;
+            local.RegionSize = view->size;
         if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, PartitionId))
         {
+            void *lock_base = region_start;
+            size_t lock_size = (size_t)(region_end - region_start);
+
             base = region_start;
-            info->CommitSize = 0;
+            local.CommitSize = 0;
             vprot_mask = VPROT_COMMITTED;
             if (!is_view_valloc( view )) vprot_mask |= PAGE_WRITECOPY;
+            if (view->protect & SEC_RESERVE) vm_prot_lock_range( lock_base, lock_size );
             while (base != region_end &&
                    (size = get_committed_size( view, base, ~(size_t)0, &vprot, vprot_mask )))
             {
-                if ((vprot & vprot_mask) == vprot_mask) info->CommitSize += size;
+                if ((vprot & vprot_mask) == vprot_mask) local.CommitSize += size;
                 base += size;
             }
+            if (view->protect & SEC_RESERVE) vm_prot_unlock_range( lock_base, lock_size );
         }
     }
     else
     {
         if (!fake_reserved)
         {
-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            virtual_read_leave( acquired, &sigset );
+            if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
             return STATUS_INVALID_ADDRESS;
         }
-        info->AllocationBase = region_start;
-        info->AllocationProtect = PAGE_NOACCESS;
-        info->RegionType = 0; /* FIXME */
-        info->RegionSize = region_end - region_start;
-        info->CommitSize = 0;
+        local.AllocationBase = region_start;
+        local.AllocationProtect = PAGE_NOACCESS;
+        local.RegionType = 0; /* FIXME */
+        local.RegionSize = region_end - region_start;
+        local.CommitSize = 0;
     }
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_read_leave( acquired, &sigset );
+    if (stats) VVM_ADD( qv_total_ns, victory_vm_now_ns() - t0 );
+
+    info->AllocationBase = local.AllocationBase;
+    info->AllocationProtect = local.AllocationProtect;
+    info->RegionType = local.RegionType;
+    if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, CommitSize))
+        info->RegionSize = local.RegionSize;
+    if (len >= FIELD_OFFSET(MEMORY_REGION_INFORMATION, PartitionId))
+        info->CommitSize = local.CommitSize;
 
     if (res_len) *res_len = sizeof(*info);
     return STATUS_SUCCESS;
@@ -6377,7 +6948,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
     start = ref[0].addr;
     end = ref[count - 1].addr + page_size;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     init_fill_working_set_info_data( &data, end );
 
     view = find_view_range( start, end - start );
@@ -6408,7 +6979,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
 
     free_fill_working_set_info_data( &data );
     if (ref != ref_buffer) free( ref );
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
 
     if (res_len)
         *res_len = len;
@@ -6901,7 +7472,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         return status;
     }
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
 
     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
@@ -6917,7 +7488,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         {
             TRACE( "not freeing in-use builtin %p\n", view->base );
             builtin->refcount--;
-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            virtual_write_leave( &sigset );
             return STATUS_SUCCESS;
         }
     }
@@ -6940,7 +7511,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
     }
     else FIXME( "failed to unmap %p %x\n", view->base, status );
 done:
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -7092,7 +7663,7 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
         return result.virtual_flush.status;
     }
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     if (!(view = find_view( addr, *size_ptr ))) status = STATUS_INVALID_PARAMETER;
     else
     {
@@ -7103,7 +7674,7 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
             status = STATUS_NOT_MAPPED_DATA;
 #endif
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -7117,6 +7688,9 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
 {
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
+    ULONGLONG t0 = 0, t1 = 0, t2 = 0, ts0 = 0, ts1 = 0, sig_ns = 0;
+    int stats = victory_vm_stats_enabled();
+    int acquired;
 
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
@@ -7130,7 +7704,141 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
     TRACE( "%p %x %p-%p %p %lu\n", process, flags, base, (char *)base + size,
            addresses, *count );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        t0 = victory_vm_now_ns();
+        VVM_INC( ww_calls );
+        VVM_ADD( ww_pages_checked, size >> page_shift );
+    }
+
+#ifdef USE_UFFD_WRITEWATCH
+    if (use_kernel_writewatch && !enable_write_exceptions)
+    {
+        struct pm_scan_arg arg = { 0 };
+        struct page_region rgns[256];
+        SIZE_T buffer_len = *count;
+        ULONG_PTR out_count = 0;
+        char *addr = ROUND_ADDR( base, host_page_mask );
+        size_t rem_size = ROUND_SIZE( base, size, host_page_mask );
+        size_t end = (size_t)((char *)base + size);
+        size_t granularity_pages = host_page_size / page_size;
+        ULONGLONG scan_ns = 0;
+        int rgn_count, i;
+
+        arg.size = sizeof(arg);
+        arg.vec = (ULONG_PTR)rgns;
+        arg.vec_len = ARRAY_SIZE(rgns);
+        if (flags & WRITE_WATCH_FLAG_RESET) arg.flags = PM_SCAN_WP_MATCHING;
+        arg.category_mask = PAGE_IS_WRITTEN;
+        arg.return_mask = PAGE_IS_WRITTEN;
+
+        if (stats)
+        {
+            t1 = victory_vm_now_ns();
+            virtual_read_sig_enter( &sigset );
+            t2 = victory_vm_now_ns();
+            sig_ns += t2 - t1;
+            acquired = virtual_fault_read_enter();
+            VVM_ADD( ww_lock_ns, victory_vm_now_ns() - t2 );
+        }
+        else acquired = virtual_read_enter( &sigset );
+
+        if (!is_write_watch_range( base, size ))
+        {
+            virtual_fault_read_leave( acquired );
+            if (stats)
+            {
+                ULONGLONG u0 = victory_vm_now_ns();
+                virtual_read_sig_leave( &sigset );
+                sig_ns += victory_vm_now_ns() - u0;
+                VVM_INC( ww_fail );
+                VVM_ADD( ww_sig_ns, sig_ns );
+                VVM_ADD( ww_total_ns, victory_vm_now_ns() - t0 );
+                victory_vm_maybe_report();
+            }
+            else virtual_read_sig_leave( &sigset );
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        virtual_fault_read_leave( acquired );
+        if (stats)
+        {
+            ULONGLONG u0 = victory_vm_now_ns();
+            virtual_read_sig_leave( &sigset );
+            sig_ns += victory_vm_now_ns() - u0;
+        }
+        else virtual_read_sig_leave( &sigset );
+
+        while (1)
+        {
+            if (stats) ts0 = victory_vm_now_ns();
+            arg.start = (UINT_PTR)addr;
+            arg.end = arg.start + rem_size;
+            arg.max_pages = (buffer_len + granularity_pages - 1) / granularity_pages;
+            rgn_count = ioctl( pagemap_fd, PAGEMAP_SCAN, &arg );
+
+            if (stats)
+            {
+                scan_ns += victory_vm_now_ns() - ts0;
+                VVM_INC( ww_ioctls );
+                if (rgn_count == ARRAY_SIZE(rgns)) VVM_INC( ww_rgns_multi );
+            }
+
+            if (rgn_count < 0)
+            {
+                ERR( "ioctl( PAGEMAP_SCAN ) failed, error %s.\n", strerror(errno) );
+                break;
+            }
+            if (!rgn_count) break;
+
+            assert( rgn_count <= ARRAY_SIZE(rgns) );
+            for (i = 0; i < rgn_count; ++i)
+            {
+                size_t c_addr = max( rgns[i].start, (size_t)base );
+
+                rgns[i].end = min( rgns[i].end, end );
+                assert( rgns[i].categories == PAGE_IS_WRITTEN );
+                while (buffer_len && c_addr < rgns[i].end)
+                {
+                    addresses[out_count++] = (void *)c_addr;
+                    --buffer_len;
+                    c_addr += page_size;
+                }
+                if (!buffer_len) break;
+            }
+            if (!buffer_len || rgn_count < arg.vec_len) break;
+            addr = (char *)(ULONG_PTR)arg.walk_end;
+            assert( rem_size >= addr - (char *)arg.start );
+            if (!(rem_size -= addr - (char *)arg.start)) break;
+        }
+
+        if (stats)
+        {
+            ts1 = victory_vm_now_ns();
+            VVM_ADD( ww_scan_ns, scan_ns );
+            if (out_count == 0) VVM_INC( ww_zero );
+            else VVM_ADD( ww_dirty_pages, out_count );
+            VVM_ADD( ww_sig_ns, sig_ns );
+            VVM_ADD( ww_total_ns, ts1 - t0 );
+            victory_vm_maybe_report();
+        }
+        *count = out_count;
+        *granularity = page_size;
+        return STATUS_SUCCESS;
+    }
+#endif
+
+    if (stats)
+    {
+        pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+        t1 = victory_vm_now_ns();
+        VVM_ADD( ww_sig_ns, t1 - t0 );
+        mutex_lock( &virtual_mutex );
+        t2 = victory_vm_now_ns();
+        VVM_ADD( ww_lock_ns, t2 - t1 );
+        virtual_write_lock_only();
+    }
+    else virtual_write_enter( &sigset );
 
     if (is_write_watch_range( base, size ))
     {
@@ -7138,6 +7846,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
         char *addr = base;
         char *end = addr + size;
 
+        if (stats) ts0 = victory_vm_now_ns();
         if (use_kernel_writewatch)
             kernel_get_write_watches( base, size, addresses, count, flags & WRITE_WATCH_FLAG_RESET );
         else
@@ -7158,11 +7867,34 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
                 set_page_vprot_bits( base, size, VPROT_WRITEWATCH, 0 );
             mprotect_range( base, size, 0, 0 );
         }
+        if (stats)
+        {
+            ts1 = victory_vm_now_ns();
+            VVM_ADD( ww_scan_ns, ts1 - ts0 );
+            if (*count == 0) VVM_INC( ww_zero );
+            else VVM_ADD( ww_dirty_pages, *count );
+        }
         *granularity = page_size;
     }
-    else status = STATUS_INVALID_PARAMETER;
+    else
+    {
+        status = STATUS_INVALID_PARAMETER;
+        if (stats) VVM_INC( ww_fail );
+    }
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        ULONGLONG u0, u1;
+        virtual_write_unlock_only();
+        mutex_unlock( &virtual_mutex );
+        u0 = victory_vm_now_ns();
+        pthread_sigmask( SIG_SETMASK, &sigset, NULL );
+        u1 = victory_vm_now_ns();
+        VVM_ADD( ww_sig_ns, u1 - u0 );
+        VVM_ADD( ww_total_ns, u1 - t0 );
+        victory_vm_maybe_report();
+    }
+    else virtual_write_leave( &sigset );
     return status;
 }
 
@@ -7175,6 +7907,8 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 {
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
+    ULONGLONG t0 = 0, t1 = 0, t2 = 0;
+    int stats = victory_vm_stats_enabled();
 
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
@@ -7183,14 +7917,24 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 
     if (!size) return STATUS_INVALID_PARAMETER;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (stats)
+    {
+        t0 = victory_vm_now_ns();
+        VVM_INC( rww_calls );
+        t1 = victory_vm_now_ns();
+        virtual_write_enter( &sigset );
+        t2 = victory_vm_now_ns();
+        VVM_ADD( rww_lock_ns, t2 - t1 );
+    }
+    else virtual_write_enter( &sigset );
 
     if (is_write_watch_range( base, size ))
         reset_write_watches( base, size );
     else
         status = STATUS_INVALID_PARAMETER;
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
+    if (stats) VVM_ADD( rww_total_ns, victory_vm_now_ns() - t0 );
     return status;
 }
 
@@ -7282,7 +8026,7 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
 
     TRACE("%p %p\n", addr1, addr2);
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
 
     view1 = find_view( addr1, 0 );
     view2 = find_view( addr2, 0 );
@@ -7306,7 +8050,7 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
         SERVER_END_REQ;
     }
 
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return status;
 }
 
@@ -7348,7 +8092,7 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
     sigset_t sigset;
     NTSTATUS ret = STATUS_SUCCESS;
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_enter( &sigset );
     for (i = 0; i < count; i++)
     {
         void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
@@ -7364,7 +8108,7 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
         else if (set_page_vprot_exec_write_protect( base, size ))
             mprotect_range( base, size, 0, 0 );
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    virtual_write_leave( &sigset );
     return ret;
 }
 

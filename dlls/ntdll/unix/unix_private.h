@@ -118,7 +118,15 @@ struct ntdll_thread_data
     void                     *jmp_buf;       /* setjmp buffer for exception handling */
     BOOL                      system_thread; /* thread runs only on the Unix side */
     int                      *fsync_apc_futex;
+    unsigned int              vm_crit;
+    unsigned int              vm_read_depth;
+    unsigned int              vm_pending_sigs;
+    LONGLONG                  creation_time;
 };
+
+#define VM_SIG_USR1 0x01
+#define VM_SIG_QUIT 0x02
+#define VM_SIG_INT  0x04
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
 #ifdef _WIN64

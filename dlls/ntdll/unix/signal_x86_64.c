@@ -2710,6 +2710,20 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 }
 
 
+static inline BOOL defer_vm_signal( ucontext_t *ucontext, unsigned int sig_bit )
+{
+#if defined(__x86_64__) && defined(__linux__)
+    struct ntdll_thread_data *td = ntdll_get_thread_data();
+    if (__builtin_expect( td->vm_crit != 0, 0 ))
+    {
+        __atomic_fetch_or( &td->vm_pending_sigs, sig_bit, __ATOMIC_RELAXED );
+        leave_handler( ucontext );
+        return TRUE;
+    }
+#endif
+    return FALSE;
+}
+
 /**********************************************************************
  *		int_handler
  *
@@ -2719,6 +2733,8 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
     HANDLE handle;
+
+    if (defer_vm_signal( ucontext, VM_SIG_INT )) return;
 
     if (p__wine_ctrl_routine)
     {
@@ -2753,6 +2769,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
 
+    if (defer_vm_signal( ucontext, VM_SIG_QUIT )) return;
+
     if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( RSP_sig(ucontext) ))
         user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread( 0 );
@@ -2767,6 +2785,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+
+    if (defer_vm_signal( ucontext, VM_SIG_USR1 )) return;
 
     if (ntdll_get_thread_data()->system_thread)
     {

@@ -43,6 +43,9 @@
 #ifdef HAVE_SYS_TIMES_H
 #include <sys/times.h>
 #endif
+#ifdef HAVE_SYS_RESOURCE_H
+#include <sys/resource.h>
+#endif
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
 #endif
@@ -2340,6 +2343,38 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         KERNEL_USER_TIMES kusrt;
         int unix_pid, unix_tid;
+
+#if defined(linux) && defined(HAVE_SYS_RESOURCE_H) && defined(RUSAGE_THREAD)
+        if (handle == GetCurrentThread())
+        {
+            struct ntdll_thread_data *td = ntdll_get_thread_data();
+            struct rusage ru;
+
+            if (!td->creation_time)
+            {
+                SERVER_START_REQ( get_thread_times )
+                {
+                    req->handle = wine_server_obj_handle( handle );
+                    status = wine_server_call( req );
+                    if (status == STATUS_SUCCESS) td->creation_time = reply->creation_time;
+                }
+                SERVER_END_REQ;
+                if (status != STATUS_SUCCESS) return status;
+            }
+            if (!getrusage( RUSAGE_THREAD, &ru ))
+            {
+                kusrt.CreateTime.QuadPart = td->creation_time;
+                kusrt.ExitTime.QuadPart = 0;
+                kusrt.KernelTime.QuadPart = (ULONGLONG)ru.ru_stime.tv_sec * 10000000 +
+                                            (ULONGLONG)ru.ru_stime.tv_usec * 10;
+                kusrt.UserTime.QuadPart = (ULONGLONG)ru.ru_utime.tv_sec * 10000000 +
+                                          (ULONGLONG)ru.ru_utime.tv_usec * 10;
+                if (data) memcpy( data, &kusrt, min( length, sizeof(kusrt) ));
+                if (ret_len) *ret_len = min( length, sizeof(kusrt) );
+                return STATUS_SUCCESS;
+            }
+        }
+#endif
 
         SERVER_START_REQ( get_thread_times )
         {
